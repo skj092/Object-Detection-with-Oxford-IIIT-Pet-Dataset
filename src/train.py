@@ -1,94 +1,161 @@
-from fastai.vision.all import *
-from torchvision.transforms import v2 as T
+import cv2
 import torch
-from torch.utils.data import random_split, DataLoader, Subset
-from dataset import CustomObjectDetectionDataset
-from models import model
+import os 
+import random
+import numpy as np
+import pandas as pd
+# for ignoring warnings
+import warnings
+warnings.filterwarnings('ignore')
+import cv2
+from xml.etree import ElementTree as et
+import torch
+import torchvision
+from torchvision import transforms as torchtrans
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from engine import train_one_epoch, evaluate
+import utils
+import transforms as T
+import albumentations as A
+from albumentations.pytorch.transforms import ToTensorV2
+from fastai.vision.all import *
+import math
+import sys
+import time
+
+import torch
+import torchvision.models.detection.mask_rcnn
+import utils
+from coco_eval import CocoEvaluator
+from coco_utils import get_coco_api_from_dataset
 
 
-device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+def train_one_epoch(model, optimizer, data_loader, device, epoch, print_freq, scaler=None):
+    model.train()
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    metric_logger.add_meter("lr", utils.SmoothedValue(window_size=1, fmt="{value:.6f}"))
+    header = f"Epoch: [{epoch}]"
 
+    lr_scheduler = None
+    if epoch == 0:
+        warmup_factor = 1.0 / 1000
+        warmup_iters = min(1000, len(data_loader) - 1)
+
+#         lr_scheduler = torch.optim.lr_scheduler.linear_lr(
+#             optimizer, start_factor=warmup_factor, total_iters=warmup_iters
+#         )
+        lr_scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer, step_size=10
+        )
+
+    for images, targets in metric_logger.log_every(data_loader, print_freq, header):
+        images = list(image.to(device) for image in images)
+        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+        with torch.cuda.amp.autocast(enabled=scaler is not None):
+            loss_dict = model(images, targets)
+            losses = sum(loss for loss in loss_dict.values())
+
+        # reduce losses over all GPUs for logging purposes
+        loss_dict_reduced = utils.reduce_dict(loss_dict)
+        losses_reduced = sum(loss for loss in loss_dict_reduced.values())
+
+        loss_value = losses_reduced.item()
+
+        if not math.isfinite(loss_value):
+            print(f"Loss is {loss_value}, stopping training")
+            print(loss_dict_reduced)
+            sys.exit(1)
+
+        optimizer.zero_grad()
+        if scaler is not None:
+            scaler.scale(losses).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            losses.backward()
+            optimizer.step()
+
+        if lr_scheduler is not None:
+            lr_scheduler.step()
+
+        metric_logger.update(loss=losses_reduced, **loss_dict_reduced)
+        metric_logger.update(lr=optimizer.param_groups[0]["lr"])
+
+    return
+
+# Send train=True fro training transforms and False for val/test transforms
 def get_transform(train):
-    transforms = []
+
     if train:
-        transforms.append(T.RandomHorizontalFlip(0.5))
-    transforms.append(T.ToDtype(torch.float))
-    transforms.append(T.ToTensor())
-    return T.Compose(transforms)
+        return A.Compose([
+                            A.HorizontalFlip(),
+                     # ToTensorV2 converts image to pytorch tensor without div by 255
+                            ToTensorV2()
+                        ], bbox_params={'format': 'pascal_voc', 'label_fields': ['labels']})
+    else:
+        return A.Compose([
+                            ToTensorV2()
+                        ], bbox_params={'format': 'pascal_voc', 'label_fields': ['labels']})
 
-def collate_fn(batch):
-    return tuple(zip(*batch))
-
-if __name__ == "__main__":
-    # download the dataset
+if __name__=="__main__":
     path = untar_data(URLs.PETS)
     Path.BASE_PATH  = path
-    #print(path.ls())
+    # use our dataset and defined transformations
+    dataset = FruitImagesDataset(path, 480, 480, transforms= get_transform(train=True))
+    dataset_test = FruitImagesDataset(path, 480, 480, transforms= get_transform(train=False))
 
-    # dataset and dataloader
-    ds = CustomObjectDetectionDataset(path, transform=get_transform(train=True))
+    # split the dataset in train and test set
+    torch.manual_seed(1)
+    indices = torch.randperm(len(dataset)).tolist()
 
-    # Define the dataset size and the desired split ratio
-    dataset_size = len(ds)
-    validation_split = 0.2  # 20% of the data will be used for validation
+    # train test split
+    test_split = 0.2
+    tsize = int(len(dataset)*test_split)
+    dataset = torch.utils.data.Subset(dataset, indices[:-tsize])
+    dataset_test = torch.utils.data.Subset(dataset_test, indices[-tsize:])
 
-    # Calculate the sizes of the training and validation sets
-    valid_size = int(validation_split * dataset_size)
-    train_size = dataset_size - valid_size
+    # define training and validation data loaders
+    data_loader = torch.utils.data.DataLoader(
+        dataset, batch_size=4, shuffle=True, num_workers=4,
+        collate_fn=utils.collate_fn)
 
-    # Use random_split to split the dataset into train and validation subsets
-    train_subset, valid_subset = random_split(ds, [train_size, valid_size])
+    data_loader_test = torch.utils.data.DataLoader(
+        dataset_test, batch_size=4, shuffle=False, num_workers=4,
+        collate_fn=utils.collate_fn)
 
-    # Create DataLoader objects for train and validation sets
-    batch_size = 4  # You can adjust this to your preference
-    train_loader = DataLoader(train_subset, batch_size=batch_size, collate_fn=collate_fn, shuffle=True)
-    valid_loader = DataLoader(valid_subset, batch_size=batch_size, collate_fn=collate_fn, shuffle=False)
+    len(data_loader), len(data_loader_test)
 
-    # Optionally, you can create a complete dataset for train and validation
-    train_ds = Subset(ds, train_subset.indices)
-    valid_ds = Subset(ds, valid_subset.indices)
+    # to train on gpu if selected.
+    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
-    #print(len(train_ds), len(valid_ds))
-    xb, yb = next(iter(train_loader))
-    #print(xb[0].shape)
-    #print(yb)
 
-    # testing on one batch
-    #images, targets = next(iter(train_loader))
-    #images = list(image for image in images)
-    #target = [{k: v for k, v in t.items()} for t in targets]
-    #model.to(device)
-    #output = model(images, target)  # Returns losses and detections
-    #print(output)
+    num_classes = 3
+
+    # get the model using our helper function
+    model = get_object_detection_model(num_classes)
+
+    # move model to the right device
+    model.to(device)
 
     # construct an optimizer
     params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.SGD(
-        params,
-        lr=0.005,
-        momentum=0.9,
-        weight_decay=0.0005
-    )
+    optimizer = torch.optim.SGD(params, lr=0.005,
+                                momentum=0.9, weight_decay=0.0005)
 
-    # and a learning rate scheduler
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(
-        optimizer,
-        step_size=3,
-        gamma=0.1
-    )
+    # and a learning rate scheduler which decreases the learning rate by
+    # 10x every 3 epochs
+    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer,
+                                                step_size=3,
+                                               gamma=0.1)
 
-    # let's train it for 5 epochs
+    # training for 10 epochs
     num_epochs = 1
 
-    evaluate(model, valid_loader, device=device)
-
-   # for epoch in range(num_epochs):
-   #     # train for one epoch, printing every 10 iterations
-   #     train_one_epoch(model, optimizer, train_loader, device, epoch, print_freq=10)
-   #     # update the learning rate
-   #     lr_scheduler.step()
-   #     # evaluate on the test dataset
-   #     evaluate(model, valid_loader, device=device)
-
-   # print("That's it!")
+    for epoch in range(num_epochs):
+        # training for one epoch
+        train_one_epoch(model, optimizer, data_loader, device, epoch, print_freq=10)
+        # update the learning rate
+        lr_scheduler.step()
+        # evaluate on the test dataset
+        # evaluate(model, data_loader_test, device=device)
+        torch.save(model.state_dict(),'model')
