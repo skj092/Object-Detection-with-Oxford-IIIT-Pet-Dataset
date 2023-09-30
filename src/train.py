@@ -28,6 +28,8 @@ import torchvision.models.detection.mask_rcnn
 import utils
 from coco_eval import CocoEvaluator
 from coco_utils import get_coco_api_from_dataset
+from dataset import FruitImagesDataset
+from models import get_object_detection_model
 
 
 def train_one_epoch(model, optimizer, data_loader, device, epoch, print_freq, scaler=None):
@@ -98,8 +100,8 @@ def get_transform(train):
                         ], bbox_params={'format': 'pascal_voc', 'label_fields': ['labels']})
 
 if __name__=="__main__":
-    path = untar_data(URLs.PETS)
-    Path.BASE_PATH  = path
+    path =  "../../../../root/.fastai/data/oxford-iiit-pet/"
+    path = Path(path)
     # use our dataset and defined transformations
     dataset = FruitImagesDataset(path, 480, 480, transforms= get_transform(train=True))
     dataset_test = FruitImagesDataset(path, 480, 480, transforms= get_transform(train=False))
